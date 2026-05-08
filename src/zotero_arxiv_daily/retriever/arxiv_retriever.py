@@ -116,10 +116,12 @@ class ArxivRetriever(BaseRetriever):
         client = arxiv.Client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+        
         # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+        
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
         all_paper_ids = [
@@ -127,18 +129,60 @@ class ArxivRetriever(BaseRetriever):
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
+        
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
-
+    
         # Get full information of each paper from arxiv api
         bar = tqdm(total=len(all_paper_ids))
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            batch = list(client.results(search))
-            bar.update(len(batch))
-            raw_papers.extend(batch)
+        
+        # IMPORTANT: Add delay between batches to avoid rate limiting
+        import time
+        import random
+        
+        batch_size = 10  # Reduced from 20 to be more conservative
+        retry_count = 0
+        max_retries = 3
+        
+        for i in range(0, len(all_paper_ids), batch_size):
+            # Add random delay between batches (2-5 seconds)
+            if i > 0:  # Don't delay before first request
+                delay = random.uniform(2, 5)
+                logger.info(f"Waiting {delay:.1f}s before next batch to avoid rate limiting...")
+                time.sleep(delay)
+            
+            batch_ids = all_paper_ids[i:i + batch_size]
+            
+            # Retry logic with exponential backoff
+            for attempt in range(max_retries):
+                try:
+                    search = arxiv.Search(id_list=batch_ids)
+                    batch = list(client.results(search))
+                    bar.update(len(batch))
+                    raw_papers.extend(batch)
+                    retry_count = 0  # Reset retry counter on success
+                    break  # Success, exit retry loop
+                    
+                except arxiv.HTTPError as e:
+                    if "429" in str(e) or "503" in str(e):
+                        wait_time = (2 ** attempt) * 5  # Exponential backoff: 5, 10, 20 seconds
+                        logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        
+                        if attempt == max_retries - 1:
+                            logger.error(f"Failed to fetch batch after {max_retries} attempts: {e}")
+                            bar.update(len(batch_ids))  # Update progress bar to avoid stalling
+                    else:
+                        logger.error(f"Unexpected error fetching batch: {e}")
+                        bar.update(len(batch_ids))
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Error fetching batch: {e}")
+                    bar.update(len(batch_ids))
+                    break
+        
         bar.close()
-
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
